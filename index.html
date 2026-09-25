@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Repro: mic goes silent when the only media element is waiting to autoplay (iOS 27)</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font: 15px/1.45 -apple-system, system-ui, sans-serif; margin: 16px; max-width: 760px; }
+      h1 { font-size: 18px; margin: 0 0 8px; }
+      p { margin: 6px 0; }
+      .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+      button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid #888; background: transparent; color: inherit; }
+      button:disabled { opacity: .4; }
+      #previews { display: flex; gap: 8px; min-height: 90px; }
+      #previews video { width: 120px; height: 90px; background: #000; object-fit: cover; }
+      table { border-collapse: collapse; margin: 8px 0; }
+      td { padding: 2px 10px 2px 0; }
+      td.v { font-variant-numeric: tabular-nums; }
+      .bad { color: #c0392b; font-weight: 600; }
+      .good { color: #1e8449; font-weight: 600; }
+      #verdict { font-weight: 600; min-height: 1.4em; }
+      #log { width: 100%; height: 240px; font: 12px/1.4 ui-monospace, Menlo, monospace; }
+    </style>
+  </head>
+  <body>
+    <h1>Mic goes silent when the only media element is waiting to autoplay</h1>
+    <p>
+      Tap <b>Start</b> and keep talking, then tap one of the Remount buttons and keep talking.
+      Reload the page before trying the other one.
+    </p>
+
+    <div class="row">
+      <button id="start">Start</button>
+      <button id="bug" disabled>Remount (bug)</button>
+      <button id="workaround" disabled>Remount + play() (workaround)</button>
+    </div>
+
+    <div id="previews"></div>
+    <div id="verdict"></div>
+
+    <table>
+      <tr>
+        <td>Audio track</td>
+        <td class="v" id="trackStatus">-</td>
+      </tr>
+      <tr>
+        <td>Mic RMS (0-1)</td>
+        <td class="v" id="micRms">-</td>
+      </tr>
+    </table>
+
+    <div class="row">
+      <button id="copy">Copy log</button>
+    </div>
+    <textarea id="log" readonly></textarea>
+
+    <script>
+      const $ = id => document.getElementById(id);
+
+      // ============================================================
+      // Settings
+      // ============================================================
+
+      // RMS level (0..1) above this means the microphone is delivering audio.
+      // Room noise alone keeps it above this value.
+      const RMS_THRESHOLD = 0.001;
+
+      // Silent this many seconds in a row -> reproduced.
+      const SILENT_SECONDS = 3;
+
+      // Delivering audio this many seconds in a row -> not reproduced
+      // (upgraded to reproduced if it goes silent later).
+      const FLOWING_SECONDS = 5;
+
+      // ============================================================
+      // State
+      // ============================================================
+
+      let pc1, pc2, micTrack, preview;
+      let previewCount = 0;
+
+      // The remount run on this page load: { label, silent, flowing, result }
+      let check = null;
+
+      // ============================================================
+      // Log
+      // ============================================================
+
+      const startedAt = performance.now();
+
+      function log(...args) {
+        const seconds = ((performance.now() - startedAt) / 1000).toFixed(3);
+        const line = `[${seconds}s] ${args.join(' ')}`;
+        console.log(line);
+        $('log').value += line + '\n';
+        $('log').scrollTop = $('log').scrollHeight;
+      }
+
+      log('UA:', navigator.userAgent);
+      log('maxTouchPoints:', navigator.maxTouchPoints, '(iPad reports a Mac UA by default; >0 means touch device)');
+      navigator.audioSession?.addEventListener('statechange', () => log('EVENT audioSession statechange'));
+
+      // ============================================================
+      // Start: capture, send the microphone over WebRTC, show a video-only preview
+      // ============================================================
+
+      async function start() {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        micTrack = stream.getAudioTracks()[0];
+        for (const type of ['mute', 'unmute', 'ended']) {
+          micTrack.addEventListener(type, () => log(`EVENT audio track ${type}`));
+        }
+
+        await startLoopback(micTrack);
+        mountPreview(new MediaStream(stream.getVideoTracks()));
+        setInterval(() => poll().catch(e => log('poll error', e.message)), 1000);
+      }
+
+      // Local loopback: the microphone is sent from pc1 to pc2. The received audio is never played.
+      async function startLoopback(track) {
+        pc1 = new RTCPeerConnection();
+        pc2 = new RTCPeerConnection();
+        pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
+        pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
+
+        pc1.addTrack(track);
+        await pc1.setLocalDescription();
+        await pc2.setRemoteDescription(pc1.localDescription);
+        await pc2.setLocalDescription();
+        await pc1.setRemoteDescription(pc2.localDescription);
+      }
+
+      // ============================================================
+      // Preview
+      // ============================================================
+
+      // Insert an autoplay <video> first, then assign srcObject. This is the order React produces
+      // when srcObject is assigned in componentDidMount / componentDidUpdate or a layout effect.
+      function mountPreview(mediaStream) {
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.muted = true;
+        video.playsInline = true;
+
+        const name = `preview#${++previewCount}`;
+        video.addEventListener('playing', () => log(`${name} playing`));
+
+        $('previews').appendChild(video);
+        video.srcObject = mediaStream;
+        preview = video;
+        return video;
+      }
+
+      // Remove the playing preview and mount a new one with the same MediaStream.
+      function remountPreview() {
+        const mediaStream = preview.srcObject;
+        preview.remove();
+        return mountPreview(mediaStream);
+      }
+
+      // The remount runs from a setTimeout callback, as it does in the app.
+      // Run synchronously inside the click handler, it reproduces only sometimes.
+      function runRemount(label, { callPlay }) {
+        setRemountButtonsEnabled(false);
+
+        setTimeout(() => {
+          log(`--- ${label}`);
+          check = { label, silent: 0, flowing: 0, result: null };
+          showVerdict(`Checking "${label}"... keep talking`, '');
+
+          const video = remountPreview();
+          if (callPlay) {
+            video.play().then(
+              () => log('play() resolved'),
+              e => log('play() rejected:', e.name),
+            );
+          }
+        }, 0);
+      }
+
+      // ============================================================
+      // Measurement
+      // ============================================================
+
+      let lastEnergy = null;
+      let lastFlowing = null;
+      let lastTrackStatus = '';
+
+      async function poll() {
+        const trackStatus = `readyState=${micTrack.readyState} muted=${micTrack.muted}`;
+        if (trackStatus !== lastTrackStatus) {
+          log('audio track:', trackStatus);
+          lastTrackStatus = trackStatus;
+        }
+        const trackOk = micTrack.readyState === 'live' && !micTrack.muted;
+        showValue('trackStatus', trackStatus, trackOk);
+
+        const rms = await readMicRms();
+        if (rms == null) return;
+
+        const flowing = rms > RMS_THRESHOLD;
+        if (flowing !== lastFlowing) {
+          log(`mic ${flowing ? 'flowing' : 'SILENT'} (RMS ${rms.toFixed(4)})`);
+          lastFlowing = flowing;
+        }
+        showValue('micRms', rms.toFixed(4), flowing);
+
+        judge(flowing, trackStatus);
+      }
+
+      // RMS level (0..1) of the microphone since the previous call.
+      // totalAudioEnergy accumulates audioLevel^2 * seconds,
+      // so the RMS over an interval is sqrt(delta energy / delta seconds).
+      async function readMicRms() {
+        const stats = await pc1.getStats();
+        const source = [...stats.values()].find(r => r.type === 'media-source' && r.kind === 'audio');
+        if (source?.totalAudioEnergy == null) return null;
+
+        const cur = { energy: source.totalAudioEnergy, time: performance.now() };
+        const prev = lastEnergy;
+        lastEnergy = cur;
+        if (!prev) return null;
+
+        const seconds = (cur.time - prev.time) / 1000;
+        return Math.sqrt(Math.max(0, cur.energy - prev.energy) / seconds);
+      }
+
+      // ============================================================
+      // Verdict
+      // ============================================================
+
+      function judge(flowing, trackStatus) {
+        if (!check) return;
+
+        if (flowing) {
+          check.flowing++;
+          check.silent = 0;
+        } else {
+          check.silent++;
+          check.flowing = 0;
+        }
+
+        if (check.silent >= SILENT_SECONDS && check.result !== 'REPRODUCED') {
+          finish('REPRODUCED', `microphone silent while track is ${trackStatus}`);
+        } else if (check.flowing >= FLOWING_SECONDS && !check.result) {
+          finish('not reproduced', 'microphone keeps delivering audio');
+        }
+      }
+
+      function finish(result, detail) {
+        check.result = result;
+        const message = `RESULT "${check.label}": ${result} - ${detail}`;
+        log(message);
+        showVerdict(message, result === 'REPRODUCED' ? 'bad' : 'good');
+      }
+
+      // ============================================================
+      // UI
+      // ============================================================
+
+      function showValue(id, text, ok) {
+        $(id).textContent = text;
+        $(id).className = 'v ' + (ok ? 'good' : 'bad');
+      }
+
+      function showVerdict(text, className) {
+        $('verdict').textContent = text;
+        $('verdict').className = className;
+      }
+
+      function setRemountButtonsEnabled(enabled) {
+        $('bug').disabled = !enabled;
+        $('workaround').disabled = !enabled;
+      }
+
+      $('start').onclick = async () => {
+        $('start').disabled = true;
+        try {
+          await start();
+          setRemountButtonsEnabled(true);
+        } catch (e) {
+          log('ERROR', e.name, e.message);
+          $('start').disabled = false;
+        }
+      };
+
+      $('bug').onclick = () => runRemount('Remount (bug)', { callPlay: false });
+      $('workaround').onclick = () => runRemount('Remount + play() (workaround)', { callPlay: true });
+
+      $('copy').onclick = async () => {
+        try {
+          await navigator.clipboard.writeText($('log').value);
+          log('log copied');
+        } catch {
+          $('log').select();
+          log('clipboard unavailable; log selected');
+        }
+      };
+    </script>
+  </body>
+</html>
